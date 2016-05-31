@@ -13,6 +13,7 @@
 ; * Timestamps Support - These get properly updated.
 ; * Better Documentation - os_ and disk_ functions are well documented.
 ; * Deprecates os_get_file_list - No more need for huge buffers.
+; * Better Checking - Doesn't load slack space or over sector boundries.
 
 ; ==================================================================
 ; MikeOS -- The Mike Operating System kernel
@@ -22,10 +23,6 @@
 ; ==================================================================
 
 %define FAT_DIR_ENTRY_LENGTH		32
-
-%define BUFFER_TYPE_UNUSED		0
-%define BUFFER_TYPE_DIR			1
-%define BUFFER_TYPE_FAT			2
 
 
 ; Directory entry attributes
@@ -45,6 +42,9 @@
 ; Long File Names are use a heap of attributes at the same time
 ; This includes the Volume ID bit, so they get ignored by drives that don't support them
 %define ATTRIB_LFN			(ATTRIB_READ_ONLY | ATTRIB_HIDDEN | ATTRIB_SYSTEM | ATTRIB_VOLUME_ID)
+
+
+%define DELETED_ENTRY_CHAR		0xE9
 
 ; Types of FAT filesystem
 ; The difference between FAT12 and FAT16 is just the number of bits in a cluster number.;
@@ -70,56 +70,95 @@
 
 ; Data types for a directory listing
 
+; Returns files in the current directory.
+%define DE_TYPE_FILE			(1 << 0)
+
+; Returns subdirectories of the current directory.
+%define DE_TYPE_SUBDIR			(1 << 1)
+
 ; Finds deleted files
-%define DE_TYPE_DELETED			(1 << 0)
+; Useful for data recovery when combined with DE_TYPE_EXCLUSIVE.
+%define DE_TYPE_DELETED			(1 << 2)
+
 ; Includes hidden files
-; Most functions need this, unless they are generating some kind of file listing
-%define DE_TYPE_HIDDEN			(1 << 1)
+; Most functions need this, unless they are generating some kind of file list.
+%define DE_TYPE_HIDDEN			(1 << 3)
+
 ; Includes system files
-%define DE_TYPE_SYSTEM			(1 << 2)
-; Includes directories alongside files
-%define DE_TYPE_SUBDIR			(1 << 3)
-; Excludes files and returns only directories
-%define DE_TYPE_DIR_ONLY		(1 << 4)
-; Includes all directory entries, including deleted items, volume ids, LFNs, etc.
-; Everything except unused (blank) entries.
-; Overwrites any other flags
-%define DE_TYPE_ALL			(1 << 5)
+%define DE_TYPE_SYSTEM			(1 << 4)
+
+; Excludes files that do not match the attribute flags.
+; Without this flag, the list will include normal files/subdirectories *and*
+; those with the given attributes.
+%define DE_TYPE_EXCLUSIVE		(1 << 5)
+
+; Includes everything except unused entries (e.g. deleted, volume id, LFN).
+; Overwrites any other flags.
+%define DE_TYPE_ALL			(1 << 6)
 
 
-; There's 8 KiB for the MikeOS disk buffer.
-; The general purpose buffer is use to load/cache directories and the FAT.
-; The default size of 7 KiB is allocated for the general purpose buffer
-; This allows for 14 clusters at 512 bytes/cluster or 240 files in a directory.
+; There's 8 KiB for the MikeOS disk buffer at 0x6000.
+; The disk buffer must be at an even address.
+%define DISK_BUFFER_SIZE		8 * 1024
+%define DISK_BUFFER			0x6000
 
-; There is also 512 bytes allocated to cache the BPB.
+; The directory buffer is used to cache the current directory.
+; There is 6 KiB allocated by default, enough for 192 files entries.
+; Resizing this buffer will increase the maximum supported directory size.
+
+; Next, there is the FAT buffer. This is a single sector buffer that caches the
+; most recently used FAT table sector. 
+; The FAT is only loaded one sector at a time.
+
+; After that, there is also 512 bytes allocated to cache the BPB.
 ; This helps keep track of disk changes if the 'changeline' is not supported.
+
+; Following, there is the sector buffer. All sectors are immediately loaded to
+; this buffer before being copied somewhere else. This prevents extra data
+; from being loaded that is part of the sector but not the file (known as
+; "slack space").
 
 ; Finally, there are two cluster lists.
 ; These hold the a list of clusters numbers that are part of a file.
-; The number of clusters they can hold depends of the FAT type.
+; The number of clusters they can hold depends of the FAT type and list size.
 ; However, clusters in the list must occupy whole bytes.
 ; For FAT12 it can store 128 clusters.
 ; At 512 bytes/cluster, that's enough for a 64 KiB file.
 
-; You can change the size of each but it must add up to 8 KiB (8096) overall.
-%define DISK_BUFFER_SIZE		7 * 1024
+%define MAX_SECTOR_SIZE			512
+%define MIN_SECTOR_SIZE			512
+
+; You can change the size of each item but it must add up to DISK_BUFFER_SIZE.
+; The length of each item should be aligned to MAX_SECTOR_SIZE intervals,
+; with the exception of BPB_BUFFER_SIZE, which should stay at 512 bytes.
+%define DIR_BUFFER_SIZE			6 * 1024
+%define FAT_BUFFER_SIZE			MAX_SECTOR_SIZE	
 %define BPB_BUFFER_SIZE			512
+%define SECTOR_BUFFER_SIZE		MAX_SECTOR_SIZE
 %define CLUSTER_LIST_SIZE		256
+%define CLUSTER_LIST_COUNT		2
 
 ; Calculated from the above parameters.
 %define DIR_ENTRY_LIMIT			DISK_BUFFER_SIZE / FAT_DIR_ENTRY_LENGTH
 
 ; Absolute locations of the above buffer items.
-; The disk buffer is usually located at 0x6000, between kernel and user memory.
 ; The ordering of items in the buffer doesn't matter.
-%define DISK_BUFFER			0x6000
-%define CLUSTER_LIST_1			DISK_BUFFER + DISK_BUFFER_SIZE
+%define DIR_BUFFER			DISK_BUFFER
+%define CLUSTER_LIST_1			DIR_BUFFER + DISK_BUFFER_SIZE
 %define CLUSTER_LIST_2			CLUSTER_LIST_1 + CLUSTER_LIST_SIZE
-%define BPB_BUFFER			BPB_BUFFER_SIZE
+%define BPB_BUFFER			CLUSTER_LIST_2 + CLUSTER_LIST_SIZE
+%define FAT_BUFFER			BPB_BUFFER + BPB_BUFFER_SIZE
+%define SECTOR_BUFFER			FAT_BUFFER + FAT_BUFFER_SIZE
+
+%define BUFFER_END			SECTOR_BUFFER + SECTOR_BUFFER_SIZE
+
 
 ; Uses a FAT time stamp
 %define BPB_RELOAD_TIME			10
+
+; Number of times to retry each disk read/write before returning an error.
+; Some media types (i.e. Floppy Disks) may need to be retried at least 3 times.
+%define MAX_DISK_RETRIES		3
 
 
 ; Bochs debugging macros, these should be removed before the final build.
@@ -226,7 +265,7 @@ os_get_file_list:
 	call disk_get_parameters
 	jc .done
 	
-	; Load the directory data into the general purpose buffer.
+	; Load the directory data into the directory buffer.
 	; The disk read will be skipped if the data is already cached.
 	; This is to cut down on unneeded disk reads.
 	call disk_read_directory
@@ -235,7 +274,6 @@ os_get_file_list:
 	; Start a file listing for the current directory
 	mov ax, DE_TYPE_SYSTEM
 	mov bx, DIRLIST_2
-	mov si, DISK_BUFFER
 	call disk_start_dir_listing
 	
 .get_entry:
@@ -314,6 +352,7 @@ os_load_file:
 	; starting from the first clusters from the entry.
 	mov si, CLUSTER_LIST_1
 	call disk_fetch_fat_chain
+	jc .error
 	
 	mov eax, [.size]	; Recorded file size
 	mov si, CLUSTER_LIST_1	; Pointer to cluster list
@@ -321,9 +360,6 @@ os_load_file:
 	call disk_read_fat_chain; ...and go!
 	jc .error		; Might encounter a bad cluster or I/O error
 
-	; Looks like we're done, note that the FAT data has replaced the
-	; directory data in the general purpose buffer.
-	; The next call to disk_read_directory will reload it.
 	popa
 	mov bx, [.size]
 	clc
@@ -956,10 +992,9 @@ disk_find_dir_entry:
 	mov dx, si
 	
 	; Start a directory listing with the type flags given in parameters.
-	; The directory should be in the general purpose buffer.
+	; The directory should be in the directory buffer.
 	; List 0 is always used for lists used completely internally by
 	; disk_ functions.
-	mov si, DISK_BUFFER
 	mov bx, DIRLIST_0
 	call disk_start_dir_listing
 	
@@ -1003,9 +1038,8 @@ disk_find_dir_entry:
 
 ; --------------------------------------------------------------------------
 ; disk_start_dir_listing
-; IN: AX = type flags, see DE_TYPE_* flags at the top of the file.
-; IN: BX = listing pointer, must be a valid DIRLIST structure.
-; IN: SI = pointer to the buffer containing the directory.
+; IN: AX = Type flags, see DE_TYPE_* flags at the top of the file.
+; IN: BX = Listing pointer, must be a valid DIRLIST structure.
 ; OUT: Nothing
 
 disk_start_dir_listing:
@@ -1013,9 +1047,16 @@ disk_start_dir_listing:
 	
 	; Preset the fields inside the dirlist structure.
 	; Don't do anything else yet.
-	mov [bx + DIRLIST_OFFSET_FIELD], si	; Directory offset in memory.
+	mov si, DIR_BUFFER
+
 	mov [bx + DIRLIST_TYPE_FIELD], ax	; Type flags to search for.
-	mov word [bx + DIRLIST_COUNT_FIELD], 0	; Current entry number.
+	mov [bx + DIRLIST_OFFSET_FIELD], si	; Directory offset in memory.
+
+	mov ax, [current_dir_entries]
+	mov dx, FAT_DIR_ENTRY_LENGTH
+	mul dx
+	add ax, si
+	mov word [bx + DIRLIST_END_FIELD], ax	; End of directory offset.
 
 	popa
 	ret
@@ -1030,34 +1071,34 @@ disk_start_dir_listing:
 disk_get_dir_entry:
 	pusha
 	
-	mov bx, [dirlist_type]
-	mov si, [dirlist_next]
-	
-	mov ax, [current_dir_entries]
-	mov dx, FAT_DIR_ENTRY_LENGTH
-	mul dx
-	add ax, DISK_BUFFER
-	mov dx, ax
-	
-	cmp si, DISK_BUFFER
-	jl .end_of_list
-	
+	mov cx, [bx + DIRLIST_TYPE_FIELD]
+	mov si, [bx + DIRLIST_OFFSET_FIELD]	
+	mov dx, [bx + DIRLIST_END_FIELD]
+
 .get_entry:
 	cmp si, dx
 	je .end_of_list
 	
+	; If the entry's SFN starts with a null, there are no more entries
 	cmp byte [si], 0
 	je .end_of_list
 	
-	test bx, DE_TYPE_ALL
+	; If all entries allowed, skip the rest of the checks and
+	; return this entry.
+	test cx, DE_TYPE_ALL
 	jnz .found_entry
 	
+	; Start checking the attributes against the flags.
 	mov al, [si + 11]
 	
+	; Skip LFN entries --- these make up part of a long file name.
 	test al, ATTRIB_LFN
 	jnz .next_entry
 	
-	cmp byte [si], 0xE9
+	; FAT filesystems "delete" files by changing the first character of
+	; the SFN to a special character.
+	; There 
+	cmp byte [si], DELETED_ENTRY_CHAR
 	je .check_deleted_okay
 	
 .deleted_okay:
@@ -1080,7 +1121,7 @@ disk_get_dir_entry:
 .found_entry:
 	mov [.tmp], si
 	add si, FAT_DIR_ENTRY_LENGTH
-	mov [dirlist_next], si
+	mov [bx + DIRLIST_OFFSET_FIELD]
 	
 	popa
 	mov si, [.tmp]
@@ -1089,6 +1130,7 @@ disk_get_dir_entry:
 	
 .next_entry:
 	add si, FAT_DIR_ENTRY_LENGTH
+	mov [bx + DIRLIST_OFFSET_FIELD], si
 	jmp .get_entry
 	
 .end_of_list:
@@ -1097,31 +1139,32 @@ disk_get_dir_entry:
 	ret
 
 .check_deleted_okay:
-	test bx, DE_TYPE_DELETED
+	test cx, DE_TYPE_DELETED
 	jnz .deleted_okay
 	jmp .next_entry
 	
 .check_hidden_okay:
-	test bx, DE_TYPE_HIDDEN
+	test cx, DE_TYPE_HIDDEN
 	jnz .hidden_okay
 	jmp .next_entry
 	
 .check_system_okay:
-	test bx, DE_TYPE_SYSTEM
+	test cx, DE_TYPE_SYSTEM
 	jnz .system_okay
 	jmp .next_entry
 	
 .check_subdir_okay:
-	test bx, DE_TYPE_SUBDIR
+	test cx, DE_TYPE_SUBDIR
 	jnz .subdir_okay
 	jmp .next_entry
 	
 .check_file_okay:
-	test bx, DE_TYPE_DIR_ONLY
+	test cx, DE_TYPE_DIR_ONLY
 	jz .file_okay
 	jmp .next_entry
-	
+
 .tmp					dw 0
+	
 
 
 ; --------------------------------------------------------------------------
@@ -1131,48 +1174,77 @@ disk_get_dir_entry:
 
 disk_read_bpb:
 	pusha
-	mov ax, 0
+
+	; The BPB is always located in the first sector of a FAT filesystem.
+	; It occupies one sector. 
+	; This may not be the first sector on disk,
+	; but disk_read_sectors should take care of the offset.
+
+	mov eax, 0
 	mov bx, BPB_BUFFER
 	mov cx, 1
-	mov dx, BPB_BUFFER_SIZE
+	mov edx, BPB_BUFFER_SIZE
 	call disk_read_sectors
+	; The result of disk_read_sectors in CF is returned by this function.
 	popa
 	ret
 
 
 ; --------------------------------------------------------------------------
-; disk_read_fat -- Read FAT from floppy into DISK_BUFFER
-; IN: Nothing; OUT: carry set if failure
+; disk_read_fat -- Read a cluster of the FAT into the FAT buffer
+; IN: EAX = FAT cluster number
+; OUT: carry set if failure, otherwise clear
 
 disk_read_fat:
 	pusha
 	
-	cmp byte [DISK_BUFFER_contents], DISK_BUFFER_HAS_FAT
-	je .done
-	
-	mov ax, [fat_start_sector]
-	mov bx, DISK_BUFFER
-	mov cx, [fat_sector_count]
-	mov dx, DISK_BUFFER_SIZE
+	; Check if there is anything previously cached.
+	test byte [fat_cache_status], HAS_CACHED_READ
+	jz .no_cache
+
+	; Is it the sector we want? If so, skip the disk I/O and return okay.
+	cmp eax, [cached_fat_sector]
+	je .already_cached
+
+	; Otherwise load one sector off the disk an put it in the cache.
+.no_cache:
+	push eax
+	add eax, [fat_start_sector]	; Volume sector number
+	mov bx, FAT_BUFFER		; Buffer location
+	mov cx, 1			; Number of sectors
+	mov dx, FAT_BUFFER_SIZE		; Maximum bytes to load
 	call disk_read_sectors
+	pop eax
 	
-	mov byte [DISK_BUFFER_contents], DISK_BUFFER_HAS_FAT
+	; Remember which sector was just loaded.
+	; Make sure to preserve the carry flag from disk_read_sectors.
+	pushf
+	mov [cached_fat_sector], eax
+	and byte [fat_cache_status], HAS_CACHED_READ
+	popf
 	
 .done:
 	popa
 	ret
+	
+.already_cached:
+	clc
+	jmp .done
 
 ; --------------------------------------------------------------------------
-; disk_write_fat -- Save FAT contents from DISK_BUFFER in RAM to disk
-; IN: FAT in DISK_BUFFER; OUT: carry set if failure
+; disk_write_fat -- Save FAT contents from FAT buffer to disk.
+; IN: EAX = FAT cluster number
+; OUT: Carry set if failure, otherwise clear
 
 disk_write_fat:
 	pusha
-	mov ax, [fat_start_sector]
-	mov bx, DISK_BUFFER
+
+	add eax, [fat_start_sector]
+	mov bx, FAT_BUFFER
 	mov cx, [fat_sector_count]
-	mov dx, DISK_BUFFER_SIZE
+	mov dx, FAT_BUFFER_SIZE
 	call disk_write_sectors
+
 	popa
 	ret
 
@@ -1185,34 +1257,73 @@ disk_write_fat:
 disk_read_directory:
 	pusha
 	
-	cmp byte [DISK_BUFFER_contents], DISK_BUFFER_HAS_DIR
+	; If the directory is had already been read, don't read it again.
+	; Skip the disk I/O and just return success.
+	; This greatly improves the performance of many OS calls.
+	; os_get_filename is fairly impractical without this.
+	cmp byte [current_dir_cached], 1
 	je .read_okay
 
+	; If no directory cluster has been given,
+	; read the root directory sectors instead of a directory cluster chain.
 	cmp word [current_dir_cluster], 0
 	je .read_root_dir
 
-	mov ax, [current_dir_cluster]
-	mov bx, DISK_BUFFER
+	; Should probably add more cluster lists.
+	; Using same cluster list in os_* and disk_* functions, might cause
+	; problems if an os_* function needs the read another directory.
+	; If only there was more buffer space...
+	; Oh well, they can just use the other cluster list.
+
+	; Read as many sectors as possible from the current directory.
+	mov eax, [current_dir_cluster]
+.read_current_dir:
+	mov si, CLUSTER_LIST_1
+	call disk_fetch_fat_chain
+	jc .read_failed
+
+	mov ax, DIR_BUFFER_SIZE
+	mov si, CLUSTER_LIST_1
+	mov di, DIR_BUFFER
 	call disk_read_fat_chain
 	jc .read_failed
 	
 .read_okay:
-	mov byte [DISK_BUFFER_contents], DISK_BUFFER_HAS_DIR
 	clc
+
+	; If the read succeeded, mark the directory as cached.
+	mov byte [current_dir_cached], 1
+	popa
+	ret
+
 .read_failed:
+	; Clear the cache status if the directory loaded unsuccessfully.
+	; The buffer might be full of garbage or stop halfway.
+	mov byte [current_dir_cached], 0
 	popa
 	ret
 
 .read_root_dir:
-	mov ax, [root_dir_start_sector]
-	mov bx, DISK_BUFFER
-	mov cx, [root_dir_sector_count]
-	mov dx, DISK_BUFFER_SIZE
+	; The root directory is a normal cluster chain in FAT32
+	cmp [filesystem], FSTYPE_FAT32
+	je .is_fat32
+
+	; In FAT12 and FAT16 the root directory is group of reserved sectors
+	; near the start of the disk.
+	mov ax, [root_dir_start_sector]		; First sector to load
+	mov bx, DISK_BUFFER			; Buffer address
+	mov cx, [root_dir_sector_count]		; Number of sectors to load
+	mov dx, DISK_BUFFER_SIZE		; Buffer size (avoids overflow)
 	call disk_read_sectors
 	
 	jnc .read_okay
 	jmp .read_failed
 	
+.is_fat32:
+	; To load the FAT32 root directory, get the cluster stored in the
+	; BPB and load it like any other directory.
+	mov eax, [root_dir_cluster]
+	jmp .read_current_dir
 	
 
 
@@ -1227,6 +1338,12 @@ disk_write_directory:
 	cmp word [current_dir_cluster], 0
 	je .write_root_dir
 
+	mov eax, [current_dir_cluster]
+.write_current_dir:
+	mov si, CLUSTER_LIST_1		; See disk_read_directory about this
+	call disk_fetch_fat_chain
+	jc .write_failed
+
 	mov ax, [current_dir_cluster]
 	mov bx, DISK_BUFFER
 	call disk_write_fat_chain
@@ -1234,6 +1351,9 @@ disk_write_directory:
 	ret
 
 .write_root_dir:
+	cmp byte [filesystem], FSTYPE_FAT32
+	je .is_fat32
+
 	mov ax, [root_dir_start_sector]
 	mov bx, DISK_BUFFER
 	mov cx, [root_dir_sector_count]
@@ -1241,6 +1361,10 @@ disk_write_directory:
 	call disk_write_sectors
 	popa
 	ret
+
+.is_fat32:
+	mov eax, [root_dir_cluster]
+	jmp .write_current_dir
 
 
 ; --------------------------------------------------------------------------
@@ -1252,57 +1376,228 @@ disk_write_directory:
 disk_read_sectors:
 	pusha
 
+	mov di, bx
+
+	; Cancel the read if there was a previous disk I/O error.
+	; It could be a media removal, media change or a bad sector.
+	; Additional disk operations should not be attempted until the media
+	; is successfully reloaded with disk_get_parameters.
+	; Just return failure status for any disk I/O.
 	cmp byte [force_disk_reload], 1
-	je .failure
+	je .failed
 
-	push ax
-	mov ax, [bytes_per_sector]
-	call disk_fix_size
-	pop ax
+	; Set the number of times to retry reading each sector.
+	; Reads can fail if the controller is not ready or if the media
+	; is old/unreliable. Each sector should be retried a few times before
+	; giving up and raising an error.
+	mov byte [.retries], MAX_DISK_RETRIES
+
+
+	; The sector buffer is used as an intermediate storage for loaded data.
+	; All data is loaded to the sector buffer and then copied to it's
+	; actual destination.
+	; This allows reads that aren't aligned to the sector size.
+	mov bx, SECTOR_BUFFER
 	
-.next_sector:
-	push cx
-	mov byte [.retries], 4		; Reset the retry count
-
-.try_load:
+	; Reduce the size limit if the requested size would go past the end
+	; of the segment.
 	push ax
-	call disk_convert_l2hts		; Get CHS values for this sector
+	mov ax, bx
+	add ax, dx
+	pop ax
+	jc .segment_overrun
 
-	mov ah, 02h			; Load the sector
-	mov al, 1
-	movzx eax, ax
-	stc
-	int 13h
+
+.load_loop:
+	; Are there any more sectors to read?
+	jcxz .done
+	dec cx
+
+	; Has the maximum number of bytes been reached?
+	; This is only for sector aligned reads.
+	cmp dx, 0
+	je .done
+
+	; Now to call another routine to do the actual disk I/O.
+	; Both the CHS and LBA addressing schemes are supported.
+	; LBA should be used if possible, it supports larger disks and doesn't
+	; require the disk geometry to be known.
+	; However, it may not be supported on old hardware and some emulators.
+	; Floppy disks only support CHS.
+	cmp byte [use_lba], 1
+	je .lba_read
+
+	call disk_read_chs_sector
+	jc .retry
+	jmp .check_size
+
+.lba_read:
+	call disk_read_lba_sector
 	jc .retry
 
-	pop ax
+.check_size:
+	; If there is less than one sector of data left of the requested size,
+	; copy only part of it over from the sector buffer.
+	cmp dx, [bytes_per_sector]
+	je .partial_sector
+
+	; Otherwise copy the whole sector to the read buffer.
+	; DI keeps track of the output address.
+	push cx
+	mov si, bx
+	mov cx, [bytes_per_sector]
+	rep movsb
 	pop cx
 
-	inc ax				; Increase the next sector
-	add bx, [bytes_per_sector]	; Increase the memory location
+	; Update the bytes left and sector count.
+	sub dx, [bytes_per_sector]
+	inc eax
 
-	loop .next_sector		; Decrease count and repeat if needed
+	; Reset the number of retries for the next sector.
+	mov byte [.retries], MAX_DISK_RETRIES
 
-	popa				; If all sectors have been read okay
-	clc				; return with success.
-	ret
-	
+	jmp .load_loop
+
+
 .retry:
-	pop ax
-	call disk_reset_floppy		; Reset disk between attempts
-	jc .failure			; Bailout if this fails
-	dec byte [.retries]		; Remove one retry
-	jnz .try_load			; If there are any left, try again
+	cmp byte [.retries], 0
+	je .failed
 
-	pop cx				; Otherwise, give up
-.failure:
-	mov byte [force_disk_reload], 1
+	call disk_reset
+
+	dec byte [.retries]
+	jmp .load_loop
+
+.done:
+	clc
 	popa
-	stc				; Return failure
 	ret
 
-.retries 				db 0
+.failed:
+	stc
+	popa
+	ret
 
+.segment_overrun:
+	; Make the maximum size the amount remaining in the segment.
+	not dx
+	jmp .load_loop
+
+
+	.retries				db 0
+
+	
+
+; --------------------------------------------------------------------------
+; disk_read_chs_sector --- Reads one sectors using CHS addressing.
+; IN: EAX = sector number
+; OUT: CF = set if failed, otherwise clear
+
+disk_read_chs_sector:
+	pusha
+
+	call disk_get_chs_parameters	; Fill in values for CX and DX.
+	mov ah, 0x02			; Function: Read Sectors
+	mov al, 1			; Sector Count
+	mov bx, SECTOR_BUFFER		; Buffer Address
+	stc				; Work around BIOS bugs.
+	int 0x13			; BIOS Disk Interrupt
+	
+	popa
+	ret
+
+
+	
+; --------------------------------------------------------------------------
+; disk_write_chs_sector --- Writes one sector using CHS addressing.
+; IN: EAX = sector number
+; OUT: CF = set if failed, otherwise clear.
+	
+disk_write_chs_sector:
+	pusha
+
+	call disk_get_chs_parameters
+	mov ah, 0x03
+	mov al, 1
+	mov bx, SECTOR_BUFFER
+	int 0x13
+	
+	popa
+	ret
+
+
+
+; --------------------------------------------------------------------------
+; disk_read_lba_sectors --- Reads one sector using LBA addressing.
+; IN: EBP:EAX = sector number
+; OUT: CF = set if failed, otherwise clear
+
+disk_read_lba_sector:
+	pusha
+
+
+	call disk_update_lba_packet
+	
+	mov ah, 0x42
+	mov dl, [current_drive]
+	mov si, lba_packet
+
+	popa
+	ret
+
+	
+	
+; --------------------------------------------------------------------------
+; disk_write_lba_sectors --- Reads one sector using LBA addressing.
+; IN: EBP:EAX = sector number
+; OUT: CF = set if failed, otherwise clear
+
+disk_write_lba_sector:
+	pusha
+
+	call disk_update_lba_packet
+	
+	mov ah, 0x43			; Function: Extended (LBA) Write
+	; Write flags can be set to verify written data.
+	; However, this does not work on all drives.
+	mov al, 0			; Write Flags: Write Without Verify
+	mov dl, [current_drive]	
+	mov si, lba_packet
+
+	popa
+	ret
+
+
+; disk_get_chs_parameters --- 
+; IN: EAX = LBA value
+; OUT: registers for int 0x13 operations
+disk_get_chs_parameters:
+	pushad
+
+	mov edx, 0
+	div dword [sectors_per_track]
+	inc dl
+	mov [.sector], dl
+
+	mov edx, 0
+
+
+
+	popad
+	ret
+
+disk_update_lba_packet:
+	push ax
+	; Update LBA data
+	mov word [lba_packet.sectors], 1
+	mov dword [lba_packet.lower_lba], eax
+	mov dword [lba_packet.upper_lba], ebp
+	mov word [lba_packet.offset], SECTOR_BUFFER
+	mov ax, ds
+	mov word [lba_packet.segment], ax
+
+	pop ax
+	ret
 
 ; --------------------------------------------------------------------------
 ; disk_write_sectors --- Writes a given number of sectors to the disk.
@@ -1404,7 +1699,7 @@ disk_reset_floppy:
 	push dx
 	mov ax, 0
 ; ******************************************************************
-	mov dl, [bootdev]
+	mov dl, [current_drive]
 ; ******************************************************************
 	stc
 	int 13h
@@ -1440,7 +1735,7 @@ disk_convert_l2hts:
 	pop bx
 
 ; ******************************************************************
-	mov dl, [bootdev]		; Set correct device
+	mov dl, [current_drive]		; Set correct device
 ; ******************************************************************
 
 	ret
@@ -1495,7 +1790,7 @@ disk_get_parameters:
 
 .reload_params:
 	mov ah, 0x08
-	mov dl, [bootdev]
+	mov dl, [current_drive]
 	push es
 	int 13h
 	pop es
@@ -2316,7 +2611,7 @@ disk_detect_changeline:
 	jne .no_change
 
 	mov ah, 16h
-	mov dl, [bootdev]
+	mov dl, [current_drive]
 	mov si, 0
 	int 13h
 
@@ -2344,13 +2639,13 @@ disk_reset_changeline:
 	mov ah, 15h
 	mov al, 0xFF
 	mov cx, 0xFFFF
-	mov dl, [bootdev]
+	mov dl, [current_drive]
 	int 13h
 
 	pushf
 	; Some disk controllers do not reset correctly without this
 	mov ah, 01h
-	mov dl, [bootdev]
+	mov dl, [current_drive]
 	int 13h
 	popf
 
@@ -2610,7 +2905,6 @@ disk_fix_size:
 	force_disk_reload		db 1
 	changeline_supported		db 0
 	current_disk_hash		dw 0
-	buffer_contents			db BUFFER_INVALID
 
 	root_dir_start_sector		dw 0
 	root_dir_sector_count		dw 0
@@ -2633,7 +2927,7 @@ disk_fix_size:
 	Sides dw 2
 	SecsPerTrack dw 18
 ; ******************************************************************
-	bootdev db 0			; Boot device number
+	current_drive db 0			; Boot device number
 ; ******************************************************************
 
 
