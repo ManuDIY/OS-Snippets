@@ -1133,52 +1133,93 @@ os_print_4hex:
 
 
 ; ------------------------------------------------------------------
-; os_input_string_limited --- Get a string from keyboard input, length limited.
-; IN: AX = buffer pointer, BX = maximum number of bytes to use
+; os_input_string --- Get a string from keyboard input
+; IN: AX = output address, BX = maximum bytes of output string
 ; OUT: nothing
 
-os_input_string_limited:
+os_input_string:
 	pusha
 
+	; If the character count is zero, don't do anything.
 	cmp bx, 0
 	je .done
 
-	mov cx, bx		; CX = Number of characters to add.
-	dec cx
-
-	mov bx, ax		; BX = Output strings start
-	mov si, 0		; SI = Total chars in string
-	mov di, 0		; DI = Current string offset
-
-	call os_get_cursor_pos
+	mov di, ax			; DI = Current position in buffer
+	
+	dec bx				; BX = Maximum characters in string
+	mov cx, bx			; CX = Remaining character count
 
 .get_char:
 	call os_wait_for_key
 
-	cmp ax, ENTER_KEY
-	je .finish_string
+	cmp al, 8
+	je .backspace
 
-	cmp cx, 0
-	je .get_char
+	cmp ax, 13			; The ENTER key ends the prompt
+	je .end_string
 
-	cmp di, si
-	jb .insert_char
+	; Do not add any characters if the maximum size has been reached.
+	jcxz .get_char
 
-	mov byte [bx + di], al
-	dec cx
-	inc di
-	inc si
+	; Only add printable characters (ASCII Values 32-126)
+	cmp al, ' '
+	jb .get_char
 
+	cmp al, 126
+	ja .get_char
 
+	call .add_char
 
+	loop .get_char
 
-os_input_string:
-	push bx
-	mov bx, 255
-	call os_input_string_limited
-	pop bx
+.end_string:
+	mov al, 0
+	stosb
+
+.done:
+	popa
 	ret
-	
+
+.backspace:
+	; Check if there are any characters to backspace
+	cmp cx, bx 
+	jae .get_char
+
+	inc cx				; Increase characters remaining
+	dec di				; Move the string pointer backwards
+
+	call .reverse_cursor		; Move back to the previous character
+	mov al, ' '			; Print a space on the character
+	call .add_char
+	call .reverse_cursor		; Now move the cursor back again
+
+	jmp .get_char
+
+.reverse_cursor:
+	call os_get_cursor_pos
+	cmp dl, 0			; Is the cursor at the start of line?
+	je .back_line
+
+	dec dl				; If not, just decrease the column
+	call os_move_cursor
+	ret
+
+.back_line:
+	dec dh				; Otherwise, move the cursor to the end
+	mov dl, 79			; of the previous line.
+	call os_move_cursor
+	ret
+
+
+.add_char:
+	stosb
+	mov ah, 0x0E			; Teletype Function
+	mov bh, 0			; Video Page 0
+	push bp				; Some BIOS's may mess up BP
+	int 0x10
+	pop bp
+	ret
+
 
 	
 
