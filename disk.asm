@@ -39,7 +39,7 @@
 %define ATTRIB_DIRECTORY		(1 << 4)
 ; The archive bit is used by backup utilites, should be set when a file is created, renamed or modified.
 %define ATTRIB_ARCHIVE			(1 << 5)
-; Long File Names are use a heap of attributes at the same time
+; Long File Names use a heap of attributes at the same time.
 ; This includes the Volume ID bit, so they get ignored by drives that don't support them
 %define ATTRIB_LFN			(ATTRIB_READ_ONLY | ATTRIB_HIDDEN | ATTRIB_SYSTEM | ATTRIB_VOLUME_ID)
 
@@ -47,7 +47,7 @@
 %define DELETED_ENTRY_CHAR		0xE9
 
 ; Types of FAT filesystem
-; The difference between FAT12 and FAT16 is just the number of bits in a cluster number.;
+; The difference between FAT12 and FAT16 is just the number of bits in a cluster number.
 ; However, FAT32 adds some useful features to work with larger files/volumes.
 ; The only way to check what type of FAT filesystem is in use is to check the number of clusters.
 %define FSTYPE_FAT12			1
@@ -128,10 +128,11 @@
 %define MAX_SECTOR_SIZE			512
 %define MIN_SECTOR_SIZE			512
 
+
 ; You can change the size of each item but it must add up to DISK_BUFFER_SIZE.
 ; The length of each item should be aligned to MAX_SECTOR_SIZE intervals,
 ; with the exception of BPB_BUFFER_SIZE, which should stay at 512 bytes.
-%define DIR_BUFFER_SIZE			6 * 1024
+%define DIR_BUFFER_SIZE			4 * 1024
 %define FAT_BUFFER_SIZE			MAX_SECTOR_SIZE	
 %define BPB_BUFFER_SIZE			512
 %define SECTOR_BUFFER_SIZE		MAX_SECTOR_SIZE

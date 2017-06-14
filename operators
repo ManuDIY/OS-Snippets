@@ -1,0 +1,35 @@
+Unary
+@	Byte Indirection
+*	Indirection (word)
+&	Address
+-	Negation
+~	Bitwise NOT
+!	Logical NOT
+$$	String Indirection
+
+Binary
++	Addition
+-	Subtraction
+*	Multiplication
+/	Division
+%	Modulo
+&	Bitwise AND
+|	Bitwise OR
+^	Bitwise XOR
+
+Comparison
+=	Equal
+<	Lesser
+>	Greater
+<=	Lesser or Equal
+>=	Greater or Equal
+!=	Not Equal
+
+Keywords
+PROGSTART	Start address of program
+RAMSTART	First address after program
+INK		Current ink colour
+TIMER		Lower 16-bits of system time
+VARIABLES	Address of numeric variables
+VERSION		Current API version
+

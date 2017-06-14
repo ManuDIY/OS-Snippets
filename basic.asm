@@ -1,3 +1,19 @@
+%macro BREAKHERE 1
+	mov ah, 0x0E
+	mov al, %1
+	int 0x10
+	mov si, err_break
+	jmp error
+%endmacro
+
+%macro PRINTHERE 1
+	push ax
+	mov ah, 0x0E
+	mov al, %1
+	int 0x10
+	pop ax
+%endmacro
+
 ; ==================================================================
 ; MikeOS -- The Mike Operating System kernel
 ; Copyright (C) 2006 - 2016 MikeOS Developers -- see doc/LICENSE.TXT
@@ -55,6 +71,7 @@ mainloop:
 
 	mov byte [var_stack_depth], 0
 
+	; ----- START DEBUG SECTION -----
 ;	mov cx, 20
 ;	call os_print_newline
 ;	mov si, [prog]
@@ -72,6 +89,11 @@ mainloop:
 ;	mov bh, 0
 ;	int 0x10
 ;	loop .next
+;	call os_print_newline
+	; ----- END DEBUG SECTION -----
+
+	; Skip over the previous line ending and blank lines.
+	call skip_eol
 
 	call get_numeric_variable		; If it's a variable at the start of the line,
 	jnc .numeric_sum			; this is an assign (eg "X = Y + 5")
@@ -79,7 +101,15 @@ mainloop:
 	call get_string_variable		; Same for a string variable (eg $1)
 	jnc .string_sum
 
-	call get_token				; Get a token from the start of the line
+	call get_token				; Get a token from the start of the lin
+	; ----- START DEBUG SECTION -----
+;	movzx ax, [token_type]
+;	call os_print_4hex
+;	call os_print_newline
+;	mov al, [token]
+;	call os_print_2hex
+;	call os_print_newline
+	; ----- END DEBUG SECTION -----
 	movzx ax, [token_type]
 
 	cmp ax, STRING				; Is the type a string of characters?
@@ -122,6 +152,13 @@ mainloop:
 	
 .keyword:
 	mov si, token				; Start trying to match commands
+	; ----- START DEBUG SECTION -----
+;	call os_print_string
+;	mov ax, si
+;	call os_string_length
+;	call os_print_2hex
+;	call os_print_newline
+	; ----- END DEBUG SECTION -----
 
 	mov di, alert_cmd
 	call os_string_compare
@@ -701,6 +738,7 @@ do_do:
 	call find_closing_statement
 	jc .no_end
 
+	mov [prog], si
 	jmp mainloop
 
 .loop_max:
@@ -739,8 +777,9 @@ do_else:
 .last_true:
 	; Now check if there is anything else on the line.
 	; If there is, it's a single line else, otherwise it's an else block.
-	call is_at_eol
-	jc .multiline
+	mov al, 0x0A
+	call check_symbol
+	jnc .multi_line
 
 .single_line:
 	call skip_remaining_line
@@ -749,7 +788,15 @@ do_else:
 .multi_line:
 	mov si, .search_words
 	call find_closing_statement
+	jc .no_endif
+
+	mov [prog], si
 	jmp mainloop
+
+.no_endif:
+	mov si, err_no_endif
+	jmp error
+
 
 .search_words:
 	db 'IF', 0
@@ -848,31 +895,30 @@ do_for:
 	shl ax, 1
 	mov bx, ax
 
-	; Get the loop variable
+	; Get the loop variable and remember it.
 	call get_numeric_variable		; FOR X = A TO B
 	jc .error				;     ^
-	mov di, si
+	; A pointer to the variable info is in SI
 
 	; Make sure there is an equals sign
 	mov al, '='				; FOR X = A TO B STEP C
 	call check_symbol			;       ^
 	jc .error
 	
-	; Get the initial value and set the loop variable
+	; Get the initial value
 	call get_numeric_parameter		; FOR X = A TO B STEP C
 	jc .error				;         ^
-	call set_numeric_variable
 	mov dx, ax
+	; The initial value is in AX
+
+	; Now set the loop variable from earlier to the initial value.
+	call set_numeric_variable
 
 	; Check for the 'TO' keyword
 	mov si, .to_keyword			; FOR X = A TO B STEP C
-	call choose_keyword			;           ^
+	call check_keyword			;           ^
+	jc .error
 
-.error:
-	mov si, err_syntax
-	jmp error
-
-.got_to:
 	; Now find the target value for the loop
 	call get_numeric_parameter		; FOR X = A TO B STEP C
 	jc .error				;              ^
@@ -880,15 +926,16 @@ do_for:
 	mov [for_targets + bx], ax
 	mov cx, ax
 
-	; Check for the step keyword, note that this is optional.
+	; Check for the optional step keyword
 	mov si, .step_keyword			; FOR X = A TO B STEP C
-	call choose_keyword			;                ^
+	call check_keyword			;                ^
+	jnc .has_step
 	
-	; If it wasn't specified, just use one as the step.
+	; Use the default step of one if no step was specified.
 	mov ax, 1
 	jmp .store_step
 
-.got_step:
+.has_step:
 	call get_numeric_parameter		; FOR X = A TO B STEP C
 	jc .error				;                     ^ 
 
@@ -924,7 +971,10 @@ do_for:
 .skip_loop:
 	mov si, .search_words
 	call find_closing_statement
-	jnc mainloop
+	jc .no_next
+
+	mov [prog], si
+	jmp mainloop
 
 .no_next:
 	mov si, err_for
@@ -934,14 +984,14 @@ do_for:
 	mov si, err_forloop_maximum
 	jmp error
 
+.error:
+	mov si, err_syntax
+	jmp error
 
-.to_keyword		dw 1
-			db 'TO', 0
-			dw .got_to
 
-.step_keyword		dw 1
-			db 'STEP', 0
-			dw .got_step
+
+.to_keyword		db 'TO', 0
+.step_keyword		db 'STEP', 0
 
 .search_words		db 'FOR', 0
 			db 0
@@ -1030,8 +1080,8 @@ do_gosub:
 ; GOTO
 
 do_goto:
-	call get_label
-	mov [prog], ax			; Continue the program at the label
+	call get_label		; Locate the next label in the program
+	mov [prog], ax		; Continue executing from that address
 	jmp mainloop
 
 
@@ -1053,6 +1103,8 @@ do_if:
 	jc .no_endif
 
 	mov byte [last_if_false], 1
+
+	mov [prog], si
 	jmp mainloop
 
 .single_line:
@@ -2231,6 +2283,13 @@ do_waitkey:
 ; ==================================================================
 ; INTERNAL ROUTINES FOR INTERPRETER
 
+
+%define  UNKNOWN_CHAR  0
+%define  PADDING_CHAR  1
+%define  LETTER_CHAR   2
+%define  NUMBER_CHAR   3
+%define  SYMBOL_CHAR   4
+
 ; ------------------------------------------------------------------
 ; get_numeric_parameter --- Fetches the value of any number token
 ; IN: nothing
@@ -2241,6 +2300,7 @@ get_numeric_parameter:
 	push word [prog]
 
 	call get_token
+
 	movzx ax, [token_type]
 
 	cmp ax, VARIABLE
@@ -2742,7 +2802,7 @@ check_condition:
 
 .equal: 
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	je .true
@@ -2754,7 +2814,7 @@ check_condition:
 	jc .invalid_condition
 
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	jne .true
@@ -2766,7 +2826,7 @@ check_condition:
 	jnc .lesser_equal
 
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	jb .true
@@ -2774,7 +2834,7 @@ check_condition:
 
 .lesser_equal:
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	jbe .true
@@ -2786,7 +2846,7 @@ check_condition:
 	jnc .greater_equal
 
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	ja .true
@@ -2794,7 +2854,7 @@ check_condition:
 
 .greater_equal:
 	call get_numeric_parameter
-	jc .error
+	jc .invalid_condition
 
 	cmp ax, bx
 	jae .true
@@ -2802,7 +2862,7 @@ check_condition:
 
 .str_equal:
 	call get_string_parameter
-	jc .error
+	jc .invalid_condition
 
 	call os_string_compare
 	jc .true
@@ -2811,10 +2871,10 @@ check_condition:
 .str_not_equal:
 	mov al, '='
 	call check_symbol
-	jc .error
+	jc .invalid_condition
 
 	call get_string_parameter
-	jc .error
+	jc .invalid_condition
 
 	call os_string_compare
 	jnc .true
@@ -2889,10 +2949,10 @@ check_condition:
 ; mode. 
 ; In line mode (CX=0) the sum will collect tokens until the end of the program 
 ; line is was called for.
-; In bracket mode tokens are collected until the ')' closing bracket is
+; In bracket mode (CX=1) tokens are collected until the ')' closing bracket is
 ; encounted. 
 ; 
-; CX = sum type
+; CX = sum type (0 = line, 1 = bracket)
 ; AX = result
 get_numeric_sum:
 	pusha
@@ -2902,29 +2962,20 @@ get_numeric_sum:
 	jc .error
 	mov bx, ax
 
-	; Remember where the end of the current line is.
-	push word [prog]
-	call skip_remaining_line
-	mov di, [prog]
-	pop word [prog]
-	jmp .next_part
-
-
 .next_part:
 	; Remember the pointer after the last valid token.
 	mov si, [prog]
-
-	; Ensure a sum does not go past the end of the line.
-	cmp si, di
-	jae .past_eol
 
 	call get_token
 	movzx ax, [token_type]
 
 	cmp ax, SYMBOL
-	jne .no_more_symbols
+	jne .error
 
 	mov al, [token]
+
+	cmp al, 0x0A
+	je .line_end
 
 	cmp al, '+'
 	je .add
@@ -2953,11 +3004,9 @@ get_numeric_sum:
 	cmp al, ')'
 	je .end_bracket
 
-.no_more_symbols:
+.line_end:
 	cmp cx, 0
 	jne .error
-
-	mov [prog], bp
 
 .finish_sum:
 	mov bp, sp
@@ -3046,15 +3095,6 @@ get_numeric_sum:
 
 	ret
 
-.past_eol:
-	; Line sums can terminate at the end of line.
-	cmp cx, 0
-	je .no_more_symbols
-
-	; Bracket sums cannot, they expect a closing bracket.
-	jmp .error
-
-
 
 
 ; Combines string tokens on a line into a string string.
@@ -3105,19 +3145,19 @@ get_string_sum:
 	jmp error
 
 
-
 skip_remaining_line:
 	pusha
 
 	mov di, [prog]		; Starting at the current point
 	mov al, 10		; Search for the newline character
 
-	mov cx, [prog_end]	; Until the proram end
+	mov cx, [prog_end]	; Until the program end
 	sub cx, di
 
 	repne scasb		; ...and go!
-	mov [prog], di		; Save the new location.
 	jne .past_end		; Was the newline actually located?
+
+	mov [prog], di		; Save the new location.
 
 	popa			; If so, we've found the next line.
 	clc
@@ -3126,6 +3166,21 @@ skip_remaining_line:
 .past_end:
 	popa
 	stc
+	ret
+
+
+; Skip over line endings and blank lines.
+skip_eol:
+	push ax
+
+.next_line:
+	; Line feeds show up as a symbol, skip over as many as possible.
+	; Separating whitespace is ignored by the token processor.
+	mov al, 0x0A
+	call check_symbol
+	jnc .next_line
+
+	pop ax
 	ret
 
 
@@ -3288,6 +3343,33 @@ choose_keyword:
 	ret
 
 
+check_keyword:
+	pusha
+	push word [prog]
+
+	call get_token
+
+	cmp byte [token_type], STRING
+	jne .not_found
+
+	mov di, token
+	call os_string_compare
+	jnc .not_found
+
+	add sp, 2
+	popa
+
+	clc
+	ret
+
+.not_found:
+	pop word [prog]
+	popa
+
+	stc
+	ret
+
+
 choose_symbol:
 	pusha
 	push word [prog]
@@ -3353,6 +3435,42 @@ check_symbol:
 	ret
 
 	
+
+basic_print_string:
+	pusha
+
+.next:
+	lodsb
+	cmp al, 0
+	je .done
+
+	call basic_print_char
+	jmp .next
+
+.done:
+	popa
+	ret
+
+
+basic_print_line:
+	pusha
+
+.next:
+	lodsb
+
+	cmp al, 0x0A
+	je .done
+
+	cmp al, 0
+	je .done
+
+	call basic_print_char
+	jmp .next
+
+.done:
+	popa
+	ret
+
 
 basic_print_char:
 	pusha
@@ -3452,9 +3570,24 @@ basic_set_cursor:
 	ret
 
 
+; Locates the ending statement for a conditional block.
+; Search starts from the current program address.
+;
+; IN: SI = address of search term block.
+; OUT: SI = ending address, CF = set if not found, otherwise clear
+;
+; The search term block contains four comma terminated strings.
+; 1st: The statement that starts a new loop (e.g. IF/DO/FOR).
+; 2nd: The statement that prevents a multiline block (e.g. THEN).
+; 3rd: An alternative statement to break at (e.g. ELSE).
+; 4rd: Block terminating statement. (e.g. ENDIF/LOOP/NEXT).
 find_closing_statement:
 	pusha
 
+	push word [prog]
+
+	mov [prog], si
+	mov di, si
 	mov di, .terms
 	lodsw
 	mov cx, ax
@@ -3472,7 +3605,7 @@ find_closing_statement:
 
 .try_next_line:
 	call skip_remaining_line
-	jc .past_end
+	jc .not_found
 
 	; Check the first STRING token on each line.
 	; This keyword should only be a command.
@@ -3504,27 +3637,50 @@ find_closing_statement:
 
 
 .sub_block:
-	push word [prog]
+	; Check if the single line statement is present.
+	; If so this line can be ignored, it's not a sub-block.
+	call get_token
+	
+	cmp byte [token_type], STRING
+	jne .recurse
 
-.search_for_single_line:
+	mov di, [.terms + 2]
+	call os_string_compare
+	jc .try_next_line
 
-.skip_block:
-	inc byte [.recursion_level]
-
+.recurse:
+	; Otherwise it is a subblock and must be scanned recursively.
 	call find_closing_statement
 	jc .not_found
 
-	dec byte [.recursion_level]
+	; Keep going from the end of the subblock.
+	mov [prog], si
 
 	jmp .try_next_line
-	
-	
 
 
-	
+.not_found:
+	pop word [prog]
+	popa
+
+	stc
+	ret
+
+
+.found_keyword:
+	mov [.result], si
+
+	pop word [prog]
+	popa
+
+	mov si, [.result]
+
+	clc
+	ret
+
 
 .terms			times 4 dw 0
-.recursion_level	db 0
+.result			dw 0
 
 
 hexadecimal_to_int:
@@ -3608,11 +3764,11 @@ set_var:
 ; ------------------------------------------------------------------
 ; Get token from current position in prog
 
+; Retrieve the next token from the program.
 get_token:
 	pusha
 
 	mov word si, [prog]
-	mov bx, char_types
 
 .get_next:
 	cmp si, [prog_end]
@@ -3620,16 +3776,16 @@ get_token:
 
 	call get_char
 
-	cmp ah, 1
+	cmp ah, PADDING_CHAR
 	je .get_next
 
 	cmp al, '0'
 	je get_hexadecimal_token
 
-	cmp ah, 3
+	cmp ah, NUMBER_CHAR
 	je get_number_token
 
-	cmp ah, 2
+	cmp ah, LETTER_CHAR
 	je get_string_token
 
 	cmp al, '$'
@@ -3644,7 +3800,7 @@ get_token:
 	cmp al, '('
 	je get_sum_token
 
-	cmp ah, 4
+	cmp ah, SYMBOL_CHAR
 	je get_symbol_token
 
 .bad_token:
@@ -3659,13 +3815,11 @@ get_token:
 get_string_var_token:
 	call get_char
 	
-	cmp ah, 3
-	jne .invalid
-
-	mov [prog], si
-
 	cmp al, '$'
 	je .pointer
+
+	cmp ah, NUMBER_CHAR
+	jne .invalid
 
 	cmp al, '0'
 	je .invalid
@@ -3678,6 +3832,8 @@ get_string_var_token:
 	shl ax, 7
 	add ax, string_vars
 	
+	mov [prog], si
+
 	mov [token], ax
 	mov byte [token_type], STRING_VAR
 	popa
@@ -3688,22 +3844,25 @@ get_string_var_token:
 	jmp error
 
 .pointer:
+	mov [prog], si
+
 	call get_numeric_parameter
 	jc .invalid
 
 	mov [token], ax
+	mov byte [token_type], STRING_VAR
+	popa
 	ret
 
 
 
 get_number_token:
 	mov bx, 0
-	mov cx, 5
 	jmp .add_numeral
 
 .get_numeral:
 	call get_char
-	cmp ah, 3
+	cmp ah, NUMBER_CHAR
 	jne .finish
 
 	; Multiply current value by ten
@@ -3718,21 +3877,17 @@ get_number_token:
 
 	add bx, ax
 
-	loop .get_numeral
-
-	inc si
+	jmp .get_numeral
 
 .finish:
-	cmp ah, 0
-	je .error
-
-	cmp ah, 2
-	je .error
-
-	mov al, 0
-	stosb
-
 	dec si
+
+	cmp ah, UNKNOWN_CHAR
+	je .error
+
+	cmp ah, LETTER_CHAR
+	je .error
+
 	mov [prog], si
 
 	mov [token], bx
@@ -3752,19 +3907,19 @@ get_string_token:
 
 .get_alphanumeric:
 	call get_char
-	cmp ah, 2
+	cmp ah, LETTER_CHAR
 	je .store_alphanumeric
 	
-	cmp ah, 3
+	cmp ah, NUMBER_CHAR
 	jne .finish
 
 .store_alphanumeric:
 	stosb
 	loop .get_alphanumeric
 
-	inc si
-
 .finish:
+	dec si
+
 	cmp ah, 0
 	je .error
 
@@ -3773,7 +3928,6 @@ get_string_token:
 	cmp al, ':'
 	je .label
 
-	dec si
 	mov [prog], si
 
 	mov ax, token
@@ -3975,12 +4129,17 @@ get_hexadecimal_token:
 
 	
 	
+; Retrieves the next character from the program and it's type.
+; IN: SI = Address to load from.
+; OUT: AH = Type, AL = Value
 get_char:
+	push bx
 	lodsb
-	mov ah, al
-	xlatb 
-	xchg ah, al
+	movzx bx, al
+	mov ah, [bx + char_types]
+	pop bx
 	ret
+
 
 
 ; Type table, provides the type number for each character.
@@ -4019,78 +4178,152 @@ error:
 
 	mov byte [work_page], 0
 	mov byte [disp_page], 0
+	mov byte [ink_colour], 7
 
-	call os_print_newline
-	call os_print_string		; Print error message
+	call basic_newline
+	
+	; Print the base message (e.g. "Error: ")
+	push si
+	mov si, err_base
+	call basic_print_string
+	pop si
 
+	; Print the error message (e.g. "unknown command")
+	call basic_print_string
 
-	mov si, line_num_starter
-	call os_print_string
+	mov si, err_separator
+	call basic_print_string
+	
+	; Figure out the line number and position.
+	mov si, [prog]
+	call find_prog_position
+	jc .unknown
 
-
-	; And now print the line number where the error occurred. We do this
-	; by working from the start of the program to the current point,
-	; counting the number of newline characters along the way
-
-	mov word si, [load_point]
-	mov word bx, [prog]
-	mov cx, 1
-
-.loop:
-	lodsb
-	cmp al, 10
-	jne .not_newline
-	inc cx
-.not_newline:
-	cmp si, bx
-	je .finish
-	jmp .loop
-.finish:
-
-	mov ax, cx
+	; Print the line number.
+	mov ax, bx
 	call os_int_to_string
 	mov si, ax
-	call os_print_string
+	call basic_print_string
 
+	; Print the line that caused the error.
+	call basic_newline
+	mov si, [prog]
 
-	call os_print_newline
+	dec cx
+	sub si, cx
+	call basic_print_line
 
+	; Print 
+	call basic_newline
+	add cx, 2
+
+.add_space:
+	mov al, ' '
+	call basic_print_char
+	loop .add_space
+
+	mov al, '^'
+	call basic_print_char
+
+.done:
+	call basic_newline
 	mov word sp, [orig_stack]	; Restore the stack to as it was when BASIC started
 
 	ret				; And finish
 
+.unknown:
+	mov si, err_position
+	call basic_print_string
+	jmp .done
+
+
+; Input: Nothing (uses current program position)
+; Output: BX = line number (from 1), CX = line offset (from 1)
+; Output: CF = set if position not valid, otherwise clear.
+find_prog_position:
+	push si
+	push di
+	push dx
+
+	mov di, [prog]
+	mov dx, [prog_end]
+	mov si, [load_point]
+
+	cmp di, si
+	jb .out_of_range
+
+	mov bx, 0
+
+.next_line:
+	inc bx
+	mov cx, 1
+	
+.next_char:
+	cmp si, di
+	jae .found_point
+
+	cmp si, dx
+	jae .out_of_range
+
+	call get_char
+
+	cmp al, 0x0A
+	je .next_line
+
+	inc cx
+	jmp .next_char
+
+.out_of_range:
+	stc
+	jmp .done
+
+.found_point:
+	clc
+
+.done:
+	pop dx
+	pop di
+	pop si
+	ret
+
+
 
 	; Error messages text...
 
-	err_char_in_num		db "Error: unexpected char in number", 0
-	err_cmd_unknown		db "Error: unknown command", 0
-	err_divide_by_zero	db "Error: attempt to divide by zero", 0
-	err_forloop_maximum	db "Error: FOR/NEXT nexting limit exceeded", 0
-	err_doloop_maximum	db "Error: DO/LOOP nesting limit exceeded", 0
-	err_file_notfound	db "Error: file not found", 0
-	err_label_notfound	db "Error: label not found", 0
-	err_nest_limit		db "Error: FOR or GOSUB nest limit exceeded", 0
-	err_for			db "Error: FOR without NEXT", 0
-	err_next		db "Error: NEXT without FOR", 0
-	err_no_do		db "Error: LOOP without DO", 0
-	err_no_loop		db "Error: DO without LOOP", 0
-	err_quote_term		db "Error: quoted string or char not terminated correctly", 0
-	err_return		db "Error: RETURN without GOSUB", 0
-	err_string_range	db "Error: string location out of range", 0
-	err_read_range		db "Error: READ out of range", 0
-	err_expected_number	db "Error: expected numeric type", 0
-	err_expected_nvar	db "Error: expected numeric variable", 0
-	err_expected_string	db "Error: expected string type", 0
-	err_expected_svar	db "Error: expected string variable", 0
-	err_condition		db "Error: invalid condition given", 0
-	err_serial_rate		db "Error: invalid serial rate", 0
-	err_sum			db "Error: bad sum", 0
-	err_no_endif		db "Error: IF block without ENDIF", 0
-	err_string_var		db "Error: unknown string variable", 0
-	err_unknown_statement	db "Error: not a command, assignment or label", 0
-	err_token		db "Error: unknown token", 0
-	err_not_hexadecimal	db "Error: invalid hexadecimal number", 0
-	err_syntax		db "Error: syntax error", 0
+	err_base		db "Error: ", 0
+	err_separator		db " in line: ", 0
+	err_line_start		db "> ", 0
+	err_position		db "(unknown)", 0
+
+	err_char_in_num		db "unexpected char in number", 0
+	err_cmd_unknown		db "unknown command", 0
+	err_divide_by_zero	db "attempt to divide by zero", 0
+	err_forloop_maximum	db "FOR/NEXT nexting limit exceeded", 0
+	err_doloop_maximum	db "DO/LOOP nesting limit exceeded", 0
+	err_file_notfound	db "file not found", 0
+	err_label_notfound	db "label not found", 0
+	err_nest_limit		db "FOR or GOSUB nest limit exceeded", 0
+	err_for			db "FOR without NEXT", 0
+	err_next		db "NEXT without FOR", 0
+	err_no_do		db "LOOP without DO", 0
+	err_no_loop		db "DO without LOOP", 0
+	err_quote_term		db "quoted string or char not terminated correctly", 0
+	err_return		db "RETURN without GOSUB", 0
+	err_string_range	db "string location out of range", 0
+	err_read_range		db "READ out of range", 0
+	err_expected_number	db "expected numeric type", 0
+	err_expected_nvar	db "expected numeric variable", 0
+	err_expected_string	db "expected string type", 0
+	err_expected_svar	db "expected string variable", 0
+	err_condition		db "invalid condition given", 0
+	err_serial_rate		db "invalid serial rate", 0
+	err_sum			db "bad sum", 0
+	err_no_endif		db "IF block without ENDIF", 0
+	err_string_var		db "unknown string variable", 0
+	err_unknown_statement	db "not a command, assignment or label", 0
+	err_token		db "unknown token", 0
+	err_not_hexadecimal	db "invalid hexadecimal number", 0
+	err_syntax		db "syntax error", 0
 	err_break		db "BREAK CALLED", 0
 
 	line_num_starter	db " - line ", 0

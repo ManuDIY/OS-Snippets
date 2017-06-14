@@ -1,0 +1,82 @@
+  for nv = na to na
+  for nv = na to na step na
+  next nv
+  read l na nv
+
+  sa = string, any
+  sv = string, variable
+  na = numeric, any
+  nv = numeric, variable
+  k = keyword
+  l = label
+  ~ = command
+
+
+  alert sa
+  askfile sv
+  break
+. call na
+  case upper sv
+  case lower sv
+  cls
+  cursor on
+  cursor off
+* curschar nv
+* curscol nv
+* curspos nv nv
+  delete sa
+  do
+  do while c
+  do until c
+  else
+  else ~
+  end
+  files
+  for nv = na to na
+  for nv = na to na step na
+* getkey nv
+  gosub l
+  goto l
+  if c then ~
+  if c
+  include sa
+  ink na
+  input sv
+  input nv
+  len sa nv
+  listbox sv sv sv nv
+  load sa na
+  loop
+  loop while c
+  loop until c
+  move na na
+  next nv
+  number na sv
+  number sa nv
+  page na na
+  pause na
+  peek nv na
+  peekint nv na
+  poke na na
+  pokeint nv na
+  port in nv na
+  port out na na
+  print sa
+  print chr na
+  print hex na
+  rand nv na na
+  read l na nv
+  rem
+  rename sa sa
+* return
+* save sa na na
+* serial on na
+* serial send na na
+* serial rec na
+* size sa
+* sound na na
+* string get sv na nv
+* string set sv na na
+* string load sv na
+* string store sv na
+  waitkey nv
